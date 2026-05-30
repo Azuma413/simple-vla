@@ -5,6 +5,17 @@ VSCodeのマーケットプレースで`Google Colab`と検索し，Googleが出
 
 
 ## 実装計画
+各部の最小アーキテクチャは，教育用に 1 部 = 1 ファイルへ分けています。
+
+- `part1_vision.py`: 合成画像データセット，小型 CNN，分類 + 座標回帰，パッチトークン抽出
+- `part2_simulator.py`: Genesis 接続前に動く tiny pick-and-place 教師データ
+- `part3_bc.py`: 低次元状態 MLP と画像 CNN+MLP の 1-step BC
+- `part4_transformer_dit.py`: 条件トークン + アクショントークンを連結する単一ストリーム Transformer
+- `part5_flow_dit.py`: adaLN 付き Flow Matching DiT と Euler サンプリング
+- `part6_vla_connector.py`: 凍結 VLM 風 hidden state を線形 connector で DiT に接続する最小 VLA
+
+`main.ipynb` は上記ファイルを順に import し，小さな合成データで学習・評価する流れになっています。
+
 ### 1. 視覚観測と表現学習
 物体識別や簡単な位置推定のタスクをCNNで解く．
 その時獲得された潜在表現をt-SNEなどで可視化することで，表現学習について体感する．
