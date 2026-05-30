@@ -1,0 +1,8 @@
+datasets/
+outputs/
+uv.lock
+__pycache__/
+.env
+.env.*
+!.env.example
+.cache/
