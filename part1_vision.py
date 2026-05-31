@@ -8,6 +8,7 @@ chapters.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -32,7 +33,7 @@ class VisionBatch:
 
 
 class ColoredSquareDataset(Dataset):
-    """Images with one colored square and exact class/position labels."""
+    """Toy fallback: images with one colored square and exact labels."""
 
     def __init__(
         self,
@@ -62,6 +63,68 @@ class ColoredSquareDataset(Dataset):
         self.images = images.clamp(0.0, 1.0)
         self.labels = labels
         self.xy = xy
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        return {"image": self.images[index], "label": self.labels[index], "xy": self.xy[index]}
+
+
+@dataclass
+class GenesisRenderConfig:
+    n: int = 256
+    image_size: int = 96
+    lighting_range: tuple[float, float] = (0.7, 1.3)
+    background_range: tuple[float, float] = (0.02, 0.12)
+    camera_jitter: float = 0.03
+    seed: int = 0
+    backend: str = "cpu"
+    cache_path: str | None = None
+
+
+class GenesisRenderDataset(Dataset):
+    """Genesis-rendered cube observations for part 1 representation learning.
+
+    The dataset is the standard path for the curriculum. It renders colored
+    cubes in the same coordinate system as the Franka task and returns
+    ``image``, ``label`` and normalized ``xy`` supervision. Use
+    ``ColoredSquareDataset`` only when Genesis is unavailable.
+    """
+
+    def __init__(self, config: GenesisRenderConfig | None = None) -> None:
+        self.config = config or GenesisRenderConfig()
+        if self.config.cache_path and Path(self.config.cache_path).exists():
+            payload = torch.load(self.config.cache_path, map_location="cpu")
+            self.images = payload["image"]
+            self.labels = payload["label"]
+            self.xy = payload["xy"]
+            return
+        self.images, self.labels, self.xy = self._render()
+        if self.config.cache_path:
+            torch.save({"image": self.images, "label": self.labels, "xy": self.xy}, self.config.cache_path)
+
+    def _render(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from part2_simulator import GenesisFrankaPickPlaceEnv, TinyPickPlaceConfig
+
+        cfg = TinyPickPlaceConfig(n_episodes=self.config.n, image_size=self.config.image_size)
+        env = GenesisFrankaPickPlaceEnv(cfg, image_size=self.config.image_size, backend=self.config.backend)
+        generator = torch.Generator().manual_seed(self.config.seed)
+        xy = torch.rand(self.config.n, 2, generator=generator) * 0.8 + 0.1
+        targets = torch.rand(self.config.n, 2, generator=generator) * 0.8 + 0.1
+        labels = torch.randint(3, (self.config.n,), generator=generator)
+        images = []
+        for i in range(self.config.n):
+            obs = env.reset(xy[i], targets[i], labels[i])
+            image = obs["image"]
+            assert isinstance(image, torch.Tensor)
+            lighting = torch.empty(1).uniform_(*self.config.lighting_range, generator=generator).item()
+            background = torch.empty(1).uniform_(*self.config.background_range, generator=generator).item()
+            noisy = image * lighting + background
+            if self.config.camera_jitter > 0:
+                noisy = noisy + self.config.camera_jitter * torch.randn(noisy.shape, generator=generator)
+            images.append(noisy.clamp(0.0, 1.0))
+        return torch.stack(images), labels, xy
 
     def __len__(self) -> int:
         return len(self.labels)

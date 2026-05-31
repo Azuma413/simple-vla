@@ -6,12 +6,13 @@ import torch
 from torch import nn
 
 from part1_vision import SmallVisionEncoder
+from part2_simulator import FRANKA_QPOS_ACTION_DIM, GENESIS_STATE_DIM, TinyPickPlaceDataset, rollout_policy
 
 
 class StateMLPPolicy(nn.Module):
     """Privileged low-dimensional state -> one action."""
 
-    def __init__(self, state_dim: int = 4, action_dim: int = 2, hidden_dim: int = 64) -> None:
+    def __init__(self, state_dim: int = GENESIS_STATE_DIM, action_dim: int = FRANKA_QPOS_ACTION_DIM, hidden_dim: int = 64) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -28,7 +29,7 @@ class StateMLPPolicy(nn.Module):
 class ImageBCPolicy(nn.Module):
     """Image -> CNN pooled feature -> one action."""
 
-    def __init__(self, action_dim: int = 2, feature_dim: int = 64) -> None:
+    def __init__(self, action_dim: int = FRANKA_QPOS_ACTION_DIM, feature_dim: int = 64) -> None:
         super().__init__()
         self.encoder = SmallVisionEncoder(feature_dim=feature_dim)
         self.head = nn.Sequential(
@@ -83,3 +84,30 @@ def evaluate_bc_mse(
         total += loss.item()
         count += y.numel()
     return total / max(count, 1)
+
+
+@torch.no_grad()
+def evaluate_bc_rollout(
+    model: nn.Module,
+    dataset: TinyPickPlaceDataset,
+    input_key: str,
+    n_episodes: int | None = 64,
+    device: str | torch.device = "cpu",
+    env=None,
+    initial_states=None,
+) -> dict[str, object]:
+    """Evaluate a one-step BC policy by closed-loop task success."""
+
+    model.eval()
+
+    def policy(obs: dict[str, torch.Tensor | str]) -> torch.Tensor:
+        x = obs[input_key]
+        assert isinstance(x, torch.Tensor)
+        action = model(x[None].to(device))
+        return action[0].cpu()
+
+    rollout_env = env or dataset
+    if initial_states is None and env is not None and hasattr(dataset, "episode_initial_state"):
+        total = getattr(getattr(dataset, "config", None), "n_episodes", n_episodes or 0)
+        initial_states = [dataset.episode_initial_state(i) for i in range(min(n_episodes or total, total))]
+    return rollout_policy(policy, rollout_env, initial_states=initial_states, n_episodes=n_episodes)

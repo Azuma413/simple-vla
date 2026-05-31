@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from part1_vision import SmallVisionEncoder
+from part2_simulator import FRANKA_QPOS_ACTION_DIM, TinyPickPlaceDataset, rollout_policy
 
 
 def make_block_attention_mask(num_condition: int, chunk_size: int, device=None) -> torch.Tensor:
@@ -58,7 +59,7 @@ class ChunkTransformerPolicy(nn.Module):
 
     def __init__(
         self,
-        action_dim: int = 2,
+        action_dim: int = FRANKA_QPOS_ACTION_DIM,
         chunk_size: int = 4,
         dim: int = 64,
         depth: int = 2,
@@ -115,3 +116,85 @@ def evaluate_chunk_mse(model: nn.Module, loader, device: str | torch.device = "c
         total += loss.item()
         count += target.numel()
     return total / max(count, 1)
+
+
+@torch.no_grad()
+def evaluate_chunk_rollout(
+    model: nn.Module,
+    dataset: TinyPickPlaceDataset,
+    n_episodes: int | None = 64,
+    device: str | torch.device = "cpu",
+    execute_chunk: bool = False,
+    env=None,
+    initial_states=None,
+) -> dict[str, object]:
+    """Evaluate the Transformer chunk policy in the closed-loop task.
+
+    By default only the first action of the predicted chunk is executed before
+    replanning. Set ``execute_chunk=True`` to expose chunk-boundary jitter.
+    """
+
+    model.eval()
+    pending: list[torch.Tensor] = []
+
+    def policy(obs: dict[str, torch.Tensor | str]) -> torch.Tensor:
+        nonlocal pending
+        frame_index = obs.get("frame_index")
+        if isinstance(frame_index, torch.Tensor) and int(frame_index) == 0:
+            pending = []
+        if execute_chunk and pending:
+            return pending.pop(0)
+        image = obs["image"]
+        assert isinstance(image, torch.Tensor)
+        chunk = model(image[None].to(device))[0].cpu()
+        pending = [a for a in chunk[1:]] if execute_chunk else []
+        return chunk[0]
+
+    rollout_env = env or dataset
+    if initial_states is None and env is not None and hasattr(dataset, "episode_initial_state"):
+        total = getattr(getattr(dataset, "config", None), "n_episodes", n_episodes or 0)
+        initial_states = [dataset.episode_initial_state(i) for i in range(min(n_episodes or total, total))]
+    return rollout_policy(policy, rollout_env, initial_states=initial_states, n_episodes=n_episodes)
+
+
+@torch.no_grad()
+def export_attention_map(model: ChunkTransformerPolicy, image: torch.Tensor, action_token: int = 0) -> torch.Tensor:
+    """Return action-token attention over CNN patch tokens from the last block."""
+
+    model.eval()
+    _ = model(image[None] if image.ndim == 3 else image)
+    weights = model.blocks[-1].last_attention
+    if weights is None:
+        raise RuntimeError("No attention weights recorded. Run a forward pass first.")
+    # [batch, heads, query, key] -> average heads for one action query.
+    _, condition = model.encoder.encode(image[None] if image.ndim == 3 else image)
+    query = condition.shape[1] + action_token
+    return weights[0, :, query, : condition.shape[1]].mean(dim=0)
+
+
+def chunk_boundary_jitter(action_chunks: torch.Tensor) -> dict[str, float]:
+    """Measure speed and boundary discontinuity for predicted chunks."""
+
+    if action_chunks.ndim == 2:
+        action_chunks = action_chunks[None]
+    step_speed = action_chunks.diff(dim=1).norm(dim=-1)
+    boundary_jump = action_chunks[:, 1:] - action_chunks[:, :-1]
+    return {
+        "mean_step_speed": float(step_speed.mean().item()) if step_speed.numel() else 0.0,
+        "mean_boundary_jitter": float(boundary_jump.norm(dim=-1).mean().item()) if boundary_jump.numel() else 0.0,
+    }
+
+
+def plot_expert_vs_rollout(expert_xy: torch.Tensor, rollout_xy: torch.Tensor):
+    """Create a matplotlib trajectory plot for expert/rollout drift."""
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    ax.plot(expert_xy[:, 0], expert_xy[:, 1], label="expert", linewidth=2)
+    ax.plot(rollout_xy[:, 0], rollout_xy[:, 1], label="rollout", linewidth=2)
+    ax.scatter(expert_xy[0, 0], expert_xy[0, 1], marker="o", color="black", s=30)
+    ax.scatter(expert_xy[-1, 0], expert_xy[-1, 1], marker="x", color="black", s=40)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend()
+    return fig

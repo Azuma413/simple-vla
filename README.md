@@ -6,15 +6,67 @@ VSCodeのマーケットプレースで`Google Colab`と検索し，Googleが出
 
 ## 実装計画
 各部の最小アーキテクチャは，教育用に 1 部 = 1 ファイルへ分けています。
+現状は PLAN.md の標準経路を `Genesis collect -> LeRobot load -> BC/Transformer/Flow train -> Genesis rollout eval -> Qwen connector` に寄せています。軽量な 2D/square 経路は，Genesis や Qwen が使えない環境での fallback です。
 
-- `part1_vision.py`: 合成画像データセット，小型 CNN，分類 + 座標回帰，パッチトークン抽出
-- `part2_simulator.py`: Genesis 接続前に動く tiny pick-and-place 教師データ
-- `part3_bc.py`: 低次元状態 MLP と画像 CNN+MLP の 1-step BC
-- `part4_transformer_dit.py`: 条件トークン + アクショントークンを連結する単一ストリーム Transformer
-- `part5_flow_dit.py`: adaLN 付き Flow Matching DiT と Euler サンプリング
-- `part6_vla_connector.py`: 凍結 VLM 風 hidden state を線形 connector で DiT に接続する最小 VLA
+- `part1_vision.py`: Genesis render dataset，小型 CNN，分類 + 座標回帰，パッチトークン抽出，square fallback
+- `part2_simulator.py`: Genesis Franka 環境，IK collector，LeRobotDataset writer/adapter，抽象 rollout 成功率評価，tiny fallback
+- `part3_bc.py`: 低次元状態 MLP と画像 CNN+MLP の 1-step BC，MSE 評価，閉ループ成功率評価
+- `part4_transformer_dit.py`: 条件トークン + アクショントークンを連結する単一ストリーム Transformer，チャンク実行評価
+- `part5_flow_dit.py`: adaLN 付き Flow Matching DiT と Euler サンプリング，サンプル軌道の閉ループ評価
+- `part6_vla_connector.py`: 凍結 Qwen3.5-0.8B の hidden state を線形 connector で DiT に接続する最小 VLA，画像+言語の閉ループ評価
 
-`main.ipynb` は上記ファイルを順に import し，小さな合成データで学習・評価する流れになっています。
+`main.ipynb` は上記ファイルを順に import し，標準では Genesis/LeRobot/Qwen の接続面を使います。ローカル依存が足りない場合だけ toy fallback で同じ train/eval 関数を動かします。
+
+### 現在の実装でできること
+- `LeRobotPickPlaceDataset` は実 LeRobotDataset を読み，3〜6章の標準キー `image`, `state`, `action`, `action_chunk`, `task`, `instruction` に変換します。
+- `TinyPickPlaceDataset` は同じキーを持つ fallback です。2D delta action は toy 専用で，教材標準のモデル default は Franka qpos target (`action_dim=9`) です。
+- `rollout_policy(policy, env, initial_states)` により，BC / Transformer / Flow / VLA connector を Genesis 環境上の `success_rate`, `mean_final_distance` で比較できます。dataset を渡す古い呼び方は tiny fallback として残しています。
+- `save_lerobot_dataset` / `save_lerobot_style_dataset` は Hugging Face LeRobot の `LeRobotDataset.create/add_frame/save_episode` を使って parquet + metadata 形式で保存します。
+- `collect_genesis_franka_lerobot_dataset` は Genesis の Franka, camera render, IK waypoint, qpos 補間を使って LeRobot Dataset を収集します。`scripted_grasp=False` が標準で，cube 追従は `scripted_grasp=True` の明示 fallback に隔離しています。
+- `QwenVLMBackbone` は `Qwen/Qwen3.5-0.8B` を `AutoProcessor` + `AutoModelForImageTextToText` で読み，画像+言語入力から hidden state 列を取り出します。VLA 側ではこの hidden を線形 connector で DiT チャネルへ射影します。
+- `train_vla_connector_epoch` / `connector_optimizer` は VLM と DiT 本体を freeze し，connector だけを更新します。full fine-tune は `train_vla_full_epoch` の ablation に分けています。
+
+### Genesis / LeRobot データ収集
+```python
+from part2_simulator import TinyPickPlaceConfig, collect_genesis_franka_lerobot_dataset
+
+collect_genesis_franka_lerobot_dataset(
+    root="data/genesis_franka_pick_place",
+    repo_id="local/simple-vla-genesis-franka",
+    config=TinyPickPlaceConfig(n_episodes=8, horizon=24, image_size=96),
+    n_episodes=8,
+    steps_per_segment=4,
+    backend="cpu",  # Colab T4 なら "gpu"
+    image_size=96,
+    scripted_grasp=False,
+)
+```
+
+### LeRobot 読み込みと Genesis 評価
+```python
+from part2_simulator import LeRobotPickPlaceDataset, GenesisFrankaPickPlaceEnv, rollout_policy
+
+dataset = LeRobotPickPlaceDataset("data/genesis_franka_pick_place", repo_id="local/simple-vla-genesis-franka", chunk_size=4)
+env = GenesisFrankaPickPlaceEnv(image_size=96, backend="cpu")
+initial_states = [dataset.episode_initial_state(i) for i in range(4)]
+metrics = rollout_policy(policy, env, initial_states)
+```
+
+### Qwen VLM 接続
+```python
+from part6_vla_connector import QwenVLMConfig, VLAConnectorPolicy, connector_optimizer
+
+policy = VLAConnectorPolicy(
+    qwen_config=QwenVLMConfig(
+        model_id="Qwen/Qwen3.5-0.8B",
+        hidden_layer=-1,
+        max_condition_tokens=128,
+    ),
+    action_dim=9,
+    chunk_size=4,
+)
+opt = connector_optimizer(policy, lr=1e-3)
+```
 
 ### 1. 視覚観測と表現学習
 物体識別や簡単な位置推定のタスクをCNNで解く．
