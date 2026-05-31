@@ -3,100 +3,154 @@
 VSCodeのマーケットプレースで`Google Colab`と検索し，Googleが出している`Colab`という名前の拡張機能を導入してください．
 任意の`.ipynb`を開いて，`カーネルを選択`からColabを選べばOK．
 
+## 前提
+それぞれの部で実装するアーキテクチャが，それぞれ1つのファイルとしてまとまるのが理想的．
+教育用のコードなので，とにかくシンプルさと読みやすさを追求したコードとするのが重要．
+不要な機能や，無駄なフォールバック機能，エラーcatch機能は不要．
 
-## 実装計画
-各部の最小アーキテクチャは，教育用に 1 部 = 1 ファイルへ分けています。
-現状は PLAN.md の標準経路を `Genesis collect -> LeRobot load -> BC/Transformer/Flow train -> Genesis rollout eval -> Qwen connector` に寄せています。軽量な 2D/square 経路は，Genesis や Qwen が使えない環境での fallback です。
+## 計画
+### 1. 運動学とシミュレータ
+Genesisを使って逆運動学ソルバーでデータ収集してみる．
+IKでスクリプト的に専門家デモを生成し、共通ベンチマークタスクを確定する。
+- Genesis on Colab の注意点
+ヘッドレス。`show_viewer=False`、`scene.add_camera(...)` + `camera.render()` でフレーム取得 → mp4化。
+`gs.init(backend=gs.gpu)` でT4使用。
+モデルはfrankaを用いる．
+- タスクと収集データ
+共通ベンチマーク = Franka pick-and-place(色付き立方体 → 目標位置)。IKで pre-grasp 姿勢へ → 把持 → 配置。各ステップで取得:
+複数視点RGB画像，特権情報
+proprioception(エンドエフェクタ姿勢，グリッパー開度)
+アクション(関節位置目標，グリッパー開度)
+LeRobot Dataset形式で保存
+- 可視化
+ロールアウト動画(IK実行)
 
-- `part1_vision.py`: Genesis render dataset，小型 CNN，分類 + 座標回帰，パッチトークン抽出，square fallback
-- `part2_simulator.py`: Genesis Franka 環境，IK collector，LeRobotDataset writer/adapter，抽象 rollout 成功率評価，tiny fallback
-- `part3_bc.py`: 低次元状態 MLP と画像 CNN+MLP の 1-step BC，MSE 評価，閉ループ成功率評価
-- `part4_transformer_dit.py`: 条件トークン + アクショントークンを連結する単一ストリーム Transformer，チャンク実行評価
-- `part5_flow_dit.py`: adaLN 付き Flow Matching DiT と Euler サンプリング，サンプル軌道の閉ループ評価
-- `part6_vla_connector.py`: 凍結 Qwen3.5-0.8B の hidden state を線形 connector で DiT に接続する最小 VLA，画像+言語の閉ループ評価
-
-`main.ipynb` は上記ファイルを順に import し，標準では Genesis/LeRobot/Qwen の接続面を使います。ローカル依存が足りない場合だけ toy fallback で同じ train/eval 関数を動かします。
-
-### 現在の実装でできること
-- `LeRobotPickPlaceDataset` は実 LeRobotDataset を読み，3〜6章の標準キー `image`, `state`, `action`, `action_chunk`, `task`, `instruction` に変換します。
-- `TinyPickPlaceDataset` は同じキーを持つ fallback です。2D delta action は toy 専用で，教材標準のモデル default は Franka qpos target (`action_dim=9`) です。
-- `rollout_policy(policy, env, initial_states)` により，BC / Transformer / Flow / VLA connector を Genesis 環境上の `success_rate`, `mean_final_distance` で比較できます。dataset を渡す古い呼び方は tiny fallback として残しています。
-- `save_lerobot_dataset` / `save_lerobot_style_dataset` は Hugging Face LeRobot の `LeRobotDataset.create/add_frame/save_episode` を使って parquet + metadata 形式で保存します。
-- `collect_genesis_franka_lerobot_dataset` は Genesis の Franka, camera render, IK waypoint, qpos 補間を使って LeRobot Dataset を収集します。`scripted_grasp=False` が標準で，cube 追従は `scripted_grasp=True` の明示 fallback に隔離しています。
-- `QwenVLMBackbone` は `Qwen/Qwen3.5-0.8B` を `AutoProcessor` + `AutoModelForImageTextToText` で読み，画像+言語入力から hidden state 列を取り出します。VLA 側ではこの hidden を線形 connector で DiT チャネルへ射影します。
-- `train_vla_connector_epoch` / `connector_optimizer` は VLM と DiT 本体を freeze し，connector だけを更新します。full fine-tune は `train_vla_full_epoch` の ablation に分けています。
-
-### Genesis / LeRobot データ収集
-```python
-from part2_simulator import TinyPickPlaceConfig, collect_genesis_franka_lerobot_dataset
-
-collect_genesis_franka_lerobot_dataset(
-    root="data/genesis_franka_pick_place",
-    repo_id="local/simple-vla-genesis-franka",
-    config=TinyPickPlaceConfig(n_episodes=8, horizon=24, image_size=96),
-    n_episodes=8,
-    steps_per_segment=4,
-    backend="cpu",  # Colab T4 なら "gpu"
-    image_size=96,
-    scripted_grasp=False,
-)
-```
-
-### LeRobot 読み込みと Genesis 評価
-```python
-from part2_simulator import LeRobotPickPlaceDataset, GenesisFrankaPickPlaceEnv, rollout_policy
-
-dataset = LeRobotPickPlaceDataset("data/genesis_franka_pick_place", repo_id="local/simple-vla-genesis-franka", chunk_size=4)
-env = GenesisFrankaPickPlaceEnv(image_size=96, backend="cpu")
-initial_states = [dataset.episode_initial_state(i) for i in range(4)]
-metrics = rollout_policy(policy, env, initial_states)
-```
-
-### Qwen VLM 接続
-```python
-from part6_vla_connector import QwenVLMConfig, VLAConnectorPolicy, connector_optimizer
-
-policy = VLAConnectorPolicy(
-    qwen_config=QwenVLMConfig(
-        model_id="Qwen/Qwen3.5-0.8B",
-        hidden_layer=-1,
-        max_condition_tokens=128,
-    ),
-    action_dim=9,
-    chunk_size=4,
-)
-opt = connector_optimizer(policy, lr=1e-3)
-```
-
-### 1. 視覚観測と表現学習
+### 2. 視覚観測と表現学習
 物体識別や簡単な位置推定のタスクをCNNで解く．
 その時獲得された潜在表現をt-SNEなどで可視化することで，表現学習について体感する．
 背景や照明変化による推定精度の低下を体感する．
 データ拡張による精度の向上を体感する．
-
-### 2. 運動学とシミュレータ
-Genesisを使って逆運動学ソルバーでデータ収集してみる．
+3〜5章でDiTに連結する視覚トークンを供給するエンコーダ。6章で凍結VLMのhiddenに置き換わるまでの「視覚の足場」。
+- データ設計
+事前に用意されたlerobotデータセットを読み込んで使う．
+テーブル上に色付き立方体を既知クラス・既知位置で配置。位置の正解ラベルが自動取得でき、照明・背景・テクスチャをプログラム制御できるためロバスト性実験が定量化できる。
+- モデル
+自作の4層CNNと事前学習済みResNet-18を比較
+分類(物体クラス) と 回帰（lerobotデータセットに保存されている物体の位置の特権情報）の2パターンを予測するように学習し，機械学習の基本である分類と回帰を学ぶ．
+エンコーダ出力としてtransformerに入力可能なパッチ特徴を取り出せるようにする．
+- 実装ステップ
+1. Genesisレンダリングによる合成データ生成(クラス/位置/照明/背景をパラメータ化，物体位置などの特権情報をstateとして保存．)
+2. Dataset/DataLoader
+3. CNN定義
+4. 学習パイプラインの実装
+5. 事前に用意した複数パターンのデータを用いたロバスト性実験(照明・背景を変えたtestで精度低下を測定)
+6. データ拡張(color jitter / random crop / 背景差し替え)で再学習 → 低下幅の縮小を確認
+- 可視化
+出力トークンをt-SNEで可視化し，物体座標やクラスで色分け
 
 ### 3. 模倣学習と行動生成
 前回収集したデータ収集プログラムを使ってデータを集める．
 これまでに学んできたCNNと，MLPを使った1 Step生成の基本的なモデルで，うまくいくかを確かめる．
 例えば低次元なPushTなら上手くいくが，ロボットマニピュレーションになると難しい，など．
 観測にノイズを入れるとどうなるか検証する．
+DiT導入前のベースライン。CNN(1章)+MLPで1ステップ行動生成(BC)
+- 2条件の対比(同一Genesisタスク内)
+特権的低次元状態入力 + MLP → 解ける(「うまくいく」体験)
+画像入力 + CNN+MLP → 1ステップだと破綻(「難しい」体験)
+- 実装ステップ
+1. LeRobot Dataset の DataLoader
+2. CNN(1章)+ MLP Policy
+3. BC学習(アクションMSE)
+4. 環境ロールアウト評価(成功率で測る)
+5. 観測ノイズ注入（テクスチャや光の強さの変更） → 性能劣化を測定
+- 可視化
+低次元成功 vs 画像破綻の並列ロールアウト動画
 
 ### 4. Transformer
 前回作成したシンプルなMLP+CNNのPolicyにTransformerを導入し，重要な情報を取捨選択できるようにする．
 それによってどのように性能や特性が変化するのかを検証する．
+1ステップMLPをTransformer化。
+実験1: CNNとMLPの間に浅いTransformer層を挟み，情報の取捨選択ができるようにする．これにより，Policyの挙動がどう変化するかを観察する．
+実験2: CNNの代わりにViTを使ってみる．どのような挙動や表現にどのような差が生まれるか確認．特にAttention Mapの確認をする．
+実験3: ViTトークン + action chunk queryを1本の系列に連結してTransformerに入力．action chunk query部分がアクションチャンクを出力するように学習してみる．系列をモデル化する事により，動作は滑らかになるが，単純な回帰ではあまりうまくいかないことを確認（次週につなげる）
+- 可視化
+self-attentionヒートマップ:アクショントークン→画像パッチへの注目が背景→対象物へ移る過程
+チャンク化による軌道の滑らかさ改善(jitter減)を動画で
 
 ### 5. 生成モデル
 CNN+MLP+TransformerのモデルにFlow mathingを導入する．
 それによってどのように性能や特性が変化するかを分析する．
+4章のTransformerをFlow Matching DiTにアップデート
+- 4章から足すもの
+1. 速度場回帰の学習目標(Flow Matching)
+2. フロー時刻 t を adaLN で条件付け
+3. 推論:ノイズから10ステップEuler積分でアクションチャンク生成
+- 実装ステップ
+1. ノイズスケジュール・補間関数
+2. adaLN時刻条件付けを4章ブロックへ追加
+3. 速度場出力ヘッド
+4. 学習(速度場MSE)
+5. 反復サンプリング推論
+6. 同一タスクで評価(リーダーボード更新)
+- 可視化
+マルチモーダル性実演:同一Genesisタスクで2通りの有効な把持アプローチがある状況を作り、MSE回帰版は平均して破綻 / Flow版は片方を選んで成功、を並列動画で
+ノイズ→アクションへ収束する生成軌道を行動空間で描画
 
 ### 6. 小規模VLA構築と失敗分析
 これまで開発してきた模倣学習モデルに小規模なVLMを導入し，VLA化する．
 VLMはとりあえずQwen3.5-0.8Bとする．
 実際に動かしてみるとうまくいかないので，その上手くいかない原因を分析する．次回ハンズオンまでの課題として，改善案を考えてきてもらう．
+完成したDiTに連結する条件プレフィックスを、CNN特徴からQwen3.5-0.8Bのhiddenへ差し替える。DiTブロックは不変。学習するのは線形コネクタ1層のみ
+- 接続
+1. Qwen3.5-0.8Bに画像+言語指示を入力 → hidden state列を取得
+2. どの層のhiddenを使うか選択できるようにしておく
+3. 線形層1枚で hidden を DiTチャネル次元へ射影
+4. その射影トークンを条件プレフィックスとしてアクションチャンクノイズに連結(=4〜5章と同じ self-attention 系列の、前半を差し替えただけ)
+- 言語条件付け
+複数色の立方体タスクで「赤い立方体を掴め」「青を掴め」等のマルチタスク化。せっかくなので日本語で学習してみる．
 
-
+## 実装
+### env.py
+genesisで実装された評価環境．
+### part1_simulator.py
+ref/以下のファイルを参考に，Genesis上でのデータ収集スクリプトを実装する．
+### part1.ipynb
+genesisの使い方を学ぶ．IKソルバーの使い方，ロボットが動く様子．
+ピックアンドプレースタスクの設計．特権情報やカメラ画像の取得方法．
+LeRobot Dataset形式による保存．
+### part2_vision.py
+一生で自作する小規模CNNと，ResNet-18の実装．
+両方ともpytorchで実装し，特にResNetは事前学習重みを読み込めるように実装する事．
+### part2.ipynb
+事前に準備されたデータセットをhugging faceから読み込む（lerobot標準機能）．
+part2_vision.pyから読み込んだ小規模CNNやResNetを使って，分類や回帰問題を学習する．
+さらにその時の潜在特徴量を可視化する．
+### part3_bc.py
+これは実装する必要がないかもしれない．
+### part3.ipynb
+part2_vision.pyから読み込んだ小規模CNNやResNetにMLPを接続し，単純な1 Step Actionの回帰予測IL Policyを実装．
+画像入力を使わない，特権情報を用いた状態観測IL Policyも実装．
+genesis上で評価してみる．
+### part4_transformer.py
+実験3のPolicyを実装．この時．エンコーダやLoss計算は切り替えられるように設計しておく．
+### part4.ipynb
+実験1, 2はそのままべた書きで実装．
+実験3はpart4_transformer.pyから読み込んで実行．
+genesis上で評価してみる．
+### part5_flow.py
+part4_transformer.pyの各パーツとの互換性を維持した状態で，flowの損失関数と，DiTを実装する．
+### part5.ipynb
+part5_flow.pyからflowの損失関数と，DiTを読み込み，part4_transformer.pyから読み込んだ，前回作成したモデルに適用してみる．
+genesis上で評価．
+そもそもDiTとFlow lossがどのように速度場を学習しているのかを，toy modelで可視化．
+### part6_vla.py
+Qwen3.5-0.8Bからhiddenを取り出すwrapperを実装．
+### part6.ipynb
+part6_vla.pyから読み込んだwrapper，
+part5_flow.pyから読み込んだflowの損失関数と，DiT
+part4_transformer.pyから読み込んだモデルのベース実装を組み合わせ，VLAを構築する．
+学習して動かしてみる．言語指示への追従性を確認する．
+OODへの汎化能力を確認する．
 
 ## 参考文献
 https://techblog.exawizards.com/entry/2023/05/10/055218
