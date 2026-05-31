@@ -11,38 +11,7 @@
 - 環境は `uv` による固定を信頼し、存在しない依存関係や未対応環境をコード側で吸収しない。
 - 実行環境は GPU が使える Genesis 環境を前提とする。
 - 各フェーズで「動くデモ」「学習ログ」「評価指標」「可視化」を最低1つずつ残す。
-
-## フェーズ 0: リポジトリ基盤整理
-
-### 目的
-
-各章の実装が同じデータ仕様、評価仕様、Notebook から使える API を共有できる状態にする。
-
-### 実装タスク
-
-- `pyproject.toml` の依存関係を確認し、Colab/ローカルの両方で必要なライブラリを明示する。
-  - `genesis-world`
-  - `lerobot`
-  - `torch`, `torchvision`
-  - `transformers`, `accelerate`, `pillow`
-  - Notebook 用の `ipykernel`
-- 共通の命名規約を確定する。
-  - 画像: `image` および LeRobot 互換の `observation.images.camera`
-  - 状態: `state` および `observation.state`
-  - アクション: `action`
-  - アクションチャンク: `action_chunk`
-  - 言語指示: `instruction` / `task`
-- `TinyPickPlaceDataset` と `LeRobotPickPlaceDataset` の出力キーを、part3 以降の全モデルがそのまま利用できる形に揃える。
-- 全フェーズで使う評価指標を統一する。
-  - 学習時: loss / MSE / accuracy
-  - ロールアウト時: success rate / final distance / expert drift
-  - 生成モデル時: sample diversity / trajectory smoothness
-
-### 完了条件
-
-- Notebook から各 `partX_*.py` を import できる。
-- Genesis で収集した LeRobot Dataset から DataLoader が作れる。
-- 1 episode の初期状態を取り出し、`rollout_policy` で評価できる。
+- コードは短ければ短いほど良い．
 
 ## フェーズ 1: 運動学とシミュレータ
 
