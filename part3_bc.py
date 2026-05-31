@@ -7,7 +7,7 @@ from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM, GENESIS_STATE_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import TinyPickPlaceDataset, rollout_policy
+from part1_simulator import rollout_policy
 
 
 class StateMLPPolicy(nn.Module):
@@ -90,7 +90,7 @@ def evaluate_bc_mse(
 @torch.no_grad()
 def evaluate_bc_rollout(
     model: nn.Module,
-    dataset: TinyPickPlaceDataset,
+    dataset,
     input_key: str,
     n_episodes: int | None = 64,
     device: str | torch.device = "cpu",

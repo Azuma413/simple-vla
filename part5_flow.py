@@ -9,7 +9,7 @@ from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import TinyPickPlaceDataset, rollout_policy
+from part1_simulator import rollout_policy
 from part4_transformer import make_block_attention_mask
 
 
@@ -120,7 +120,7 @@ def train_flow_epoch(
 @torch.no_grad()
 def evaluate_flow_rollout(
     model: FlowMatchingDiT,
-    dataset: TinyPickPlaceDataset,
+    dataset,
     n_episodes: int | None = 64,
     device: str | torch.device = "cpu",
     sample_steps: int = 8,

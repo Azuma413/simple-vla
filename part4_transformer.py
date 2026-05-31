@@ -7,7 +7,7 @@ from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import TinyPickPlaceDataset, rollout_policy
+from part1_simulator import rollout_policy
 
 
 def make_block_attention_mask(num_condition: int, chunk_size: int, device=None) -> torch.Tensor:
@@ -122,7 +122,7 @@ def evaluate_chunk_mse(model: nn.Module, loader, device: str | torch.device = "c
 @torch.no_grad()
 def evaluate_chunk_rollout(
     model: nn.Module,
-    dataset: TinyPickPlaceDataset,
+    dataset,
     n_episodes: int | None = 64,
     device: str | torch.device = "cpu",
     execute_chunk: bool = False,

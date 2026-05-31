@@ -10,7 +10,7 @@ from PIL import Image
 from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM
-from part1_simulator import TinyPickPlaceDataset, rollout_policy
+from part1_simulator import rollout_policy
 from part4_transformer import TransformerBlock, make_block_attention_mask
 
 
@@ -208,7 +208,7 @@ train_vla_epoch = train_vla_connector_epoch
 @torch.no_grad()
 def evaluate_vla_rollout(
     model: VLAConnectorPolicy,
-    dataset: TinyPickPlaceDataset,
+    dataset,
     n_episodes: int | None = 64,
     device: str | torch.device = "cpu",
     env=None,

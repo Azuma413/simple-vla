@@ -7,31 +7,24 @@ This module is the phase-1 implementation described in PLAN.md:
 - generate an IK expert trajectory through the fixed stages
   pre-grasp -> grasp -> lift -> move-to-place -> place -> retreat;
 - save RGB, robot qpos, object/target poses, gripper width, action qpos
-  targets, and task text as a LeRobot dataset;
-- provide a small stable Dataset/DataLoader adapter used by later chapters.
+  targets, and task text as a LeRobot dataset.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
 
-import imageio.v3 as iio
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 
 from env import (
-    ACTION_CHUNK_KEY as _ACTION_CHUNK_KEY,
     ACTION_KEY as _ACTION_KEY,
     COLOR_NAMES as _COLOR_NAMES,
     FRANKA_QPOS_ACTION_DIM as _FRANKA_QPOS_ACTION_DIM,
-    GENESIS_STATE_DIM as _GENESIS_STATE_DIM,
     GRIPPER_WIDTH_KEY as _GRIPPER_WIDTH_KEY,
     IMAGE_KEY as _IMAGE_KEY,
-    INSTRUCTION_KEY as _INSTRUCTION_KEY,
     OBJECT_POSE_KEY as _OBJECT_POSE_KEY,
     OBJECT_XYZ_KEY as _OBJECT_XYZ_KEY,
     ROBOT_QPOS_KEY as _ROBOT_QPOS_KEY,
@@ -92,237 +85,8 @@ def expert_drift(rollout: torch.Tensor, expert: torch.Tensor) -> float:
     return float((rollout[:common] - expert[:common]).norm(dim=-1).mean().item())
 
 
-def _as_tensor(value, dtype: torch.dtype | None = None) -> torch.Tensor:
-    tensor = torch.as_tensor(value)
-    return tensor.to(dtype=dtype) if dtype is not None else tensor
-
-
-def _image_to_chw_float(image) -> torch.Tensor:
-    if hasattr(image, "__array__") and not isinstance(image, torch.Tensor):
-        image = np.asarray(image)
-    tensor = torch.as_tensor(image)
-    if tensor.ndim == 3 and tensor.shape[-1] in (1, 3, 4):
-        tensor = tensor[..., :3].permute(2, 0, 1)
-    tensor = tensor.float()
-    if tensor.max() > 1.0:
-        tensor = tensor / 255.0
-    return tensor.clamp(0.0, 1.0)
-
-
 def _chw_float_to_hwc_uint8(image: torch.Tensor) -> np.ndarray:
     return (image.detach().cpu().permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
-
-
-def _task_from_row(row: Mapping) -> str:
-    return str(row.get(_TASK_KEY, row.get(_INSTRUCTION_KEY, "pick the cube")))
-
-
-def _canonical_sample(row: Mapping, chunk: torch.Tensor | None = None) -> dict[str, torch.Tensor | str]:
-    image = _image_to_chw_float(row[_IMAGE_KEY if _IMAGE_KEY in row else "image"])
-    state = _as_tensor(row[_STATE_KEY if _STATE_KEY in row else "state"], torch.float32).flatten()
-    action = _as_tensor(row[_ACTION_KEY], torch.float32).flatten()
-    task = _task_from_row(row)
-    out: dict[str, torch.Tensor | str] = {
-        _IMAGE_KEY: image,
-        _STATE_KEY: state,
-        _ACTION_KEY: action,
-        _ACTION_CHUNK_KEY: chunk if chunk is not None else action[None],
-        _TASK_KEY: task,
-        _INSTRUCTION_KEY: task,
-        "image": image,
-        "state": state,
-        "episode_index": _as_tensor(row.get("episode_index", 0), torch.long),
-        "frame_index": _as_tensor(row.get("frame_index", 0), torch.long),
-    }
-    for key in (
-        _ROBOT_QPOS_KEY,
-        _OBJECT_POSE_KEY,
-        _TARGET_POSE_KEY,
-        _OBJECT_XYZ_KEY,
-        _TARGET_XYZ_KEY,
-        _GRIPPER_WIDTH_KEY,
-        "timestamp",
-        "next.done",
-        "label",
-    ):
-        if key in row:
-            dtype = torch.float32
-            if key in ("next.done", "label"):
-                dtype = None
-            out[key] = _as_tensor(row[key], dtype).flatten()
-    return out
-
-
-class TinyPickPlaceDataset(Dataset):
-    """In-memory frames using the same keys as the collected LeRobot data."""
-
-    def __init__(
-        self,
-        frames: Sequence[Mapping],
-        chunk_size: int = 4,
-        initial_states: Sequence[Mapping] | None = None,
-    ) -> None:
-        self.frames = list(frames)
-        self.chunk_size = chunk_size
-        self._episode_to_indices = _build_episode_index(self.frames)
-        self._initial_states = list(initial_states) if initial_states is not None else None
-        sample = self[0]
-        self.action_dim = int(torch.as_tensor(sample[_ACTION_KEY]).numel())
-        self.state_dim = int(torch.as_tensor(sample["state"]).numel())
-        self.config = _TinyPickPlaceConfig(
-            n_episodes=len(self._episode_to_indices),
-            horizon=max(len(v) for v in self._episode_to_indices.values()),
-            action_dim=self.action_dim,
-            state_dim=self.state_dim,
-        )
-
-    def __len__(self) -> int:
-        return len(self.frames)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        row = self.frames[index]
-        episode = int(torch.as_tensor(row.get("episode_index", 0)).item())
-        indices = self._episode_to_indices[episode]
-        local = indices.index(index)
-        chunk = []
-        for offset in range(self.chunk_size):
-            chunk_index = indices[min(local + offset, len(indices) - 1)]
-            chunk.append(_as_tensor(self.frames[chunk_index][_ACTION_KEY], torch.float32).flatten())
-        return _canonical_sample(row, torch.stack(chunk))
-
-    def episode_initial_state(self, episode: int) -> dict[str, torch.Tensor | int]:
-        if self._initial_states is not None:
-            return {k: _as_tensor(v).clone() if not isinstance(v, str) else v for k, v in self._initial_states[episode].items()}
-        first = self[self._episode_to_indices[episode][0]]
-        return _initial_state_from_sample(first)
-
-
-class LeRobotPickPlaceDataset(Dataset):
-    """LeRobot adapter with stable keys for parts 2-6."""
-
-    def __init__(
-        self,
-        root: str | Path,
-        repo_id: str | None = None,
-        chunk_size: int = 4,
-        image_key: str = _IMAGE_KEY,
-        video_backend: str = "pyav",
-    ) -> None:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-        self.root = Path(root)
-        self.repo_id = repo_id or _infer_lerobot_repo_id(self.root)
-        self.chunk_size = chunk_size
-        self.image_key = image_key
-        self.dataset = LeRobotDataset(self.repo_id, root=self.root, video_backend=video_backend)
-        self._episode_to_indices = _build_episode_index(self.dataset)
-        sample = self[0]
-        self.action_dim = int(torch.as_tensor(sample[_ACTION_KEY]).numel())
-        self.state_dim = int(torch.as_tensor(sample["state"]).numel())
-        self.config = _TinyPickPlaceConfig(
-            n_episodes=len(self._episode_to_indices),
-            horizon=max(len(v) for v in self._episode_to_indices.values()),
-            action_dim=self.action_dim,
-            state_dim=self.state_dim,
-        )
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        row = dict(self.dataset[index])
-        if self.image_key != _IMAGE_KEY:
-            row[_IMAGE_KEY] = row[self.image_key]
-        episode = int(torch.as_tensor(row.get("episode_index", 0)).item())
-        indices = self._episode_to_indices[episode]
-        local = indices.index(index)
-        chunk = []
-        for offset in range(self.chunk_size):
-            chunk_index = indices[min(local + offset, len(indices) - 1)]
-            chunk.append(_as_tensor(_lerobot_feature_at(self.dataset, chunk_index, _ACTION_KEY), torch.float32).flatten())
-        return _canonical_sample(row, torch.stack(chunk))
-
-    def episode_initial_state(self, episode: int) -> dict[str, torch.Tensor | int]:
-        first = self[self._episode_to_indices[episode][0]]
-        return _initial_state_from_sample(first)
-
-
-def _infer_lerobot_repo_id(root: Path) -> str:
-    info_path = root / "meta" / "info.json"
-    if info_path.exists():
-        info = json.loads(info_path.read_text())
-        value = info.get("repo_id")
-        if isinstance(value, str):
-            return value
-    return "local/simple-vla-genesis-franka-pick-place"
-
-
-def _build_episode_index(dataset) -> dict[int, list[int]]:
-    meta = getattr(dataset, "meta", None)
-    episode_rows = getattr(meta, "episodes", None)
-    if episode_rows is not None:
-        episodes: dict[int, list[int]] = {}
-        for row in episode_rows:
-            if "dataset_from_index" in row and "dataset_to_index" in row:
-                episode = int(row["episode_index"])
-                start = int(row["dataset_from_index"])
-                end = int(row["dataset_to_index"])
-                episodes[episode] = list(range(start, end))
-        if episodes:
-            return episodes
-
-    episodes: dict[int, list[int]] = {}
-    for idx in range(len(dataset)):
-        row = dataset[idx]
-        episode = int(torch.as_tensor(row.get("episode_index", 0)).item())
-        episodes.setdefault(episode, []).append(idx)
-    return episodes
-
-
-def _lerobot_feature_at(dataset, index: int, key: str):
-    reader = dataset._ensure_reader()
-    if reader.hf_dataset is None:
-        reader.load_and_activate()
-    return reader.hf_dataset[index][key]
-
-
-def _initial_state_from_sample(sample: Mapping[str, torch.Tensor | str]) -> dict[str, torch.Tensor | int]:
-    if _OBJECT_XYZ_KEY in sample and _TARGET_XYZ_KEY in sample:
-        label_value = sample.get("label", torch.tensor([0]))
-        return {
-            _OBJECT_XYZ_KEY: torch.as_tensor(sample[_OBJECT_XYZ_KEY], dtype=torch.float32).flatten(),
-            _TARGET_XYZ_KEY: torch.as_tensor(sample[_TARGET_XYZ_KEY], dtype=torch.float32).flatten(),
-            "label": int(torch.as_tensor(label_value).flatten()[0].item()),
-        }
-    state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
-    return {
-        _OBJECT_XYZ_KEY: state[_FRANKA_QPOS_ACTION_DIM : _FRANKA_QPOS_ACTION_DIM + 3],
-        _TARGET_XYZ_KEY: state[_FRANKA_QPOS_ACTION_DIM + 3 : _FRANKA_QPOS_ACTION_DIM + 6],
-        "label": 0,
-    }
-
-
-def pick_place_collate(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, torch.Tensor | list[str]]:
-    output: dict[str, torch.Tensor | list[str]] = {}
-    for key in batch[0]:
-        values = [item[key] for item in batch]
-        if isinstance(values[0], torch.Tensor):
-            output[key] = torch.stack(values)  # type: ignore[arg-type]
-        else:
-            output[key] = values  # type: ignore[assignment]
-    return output
-
-
-collate_tiny_pick_place = pick_place_collate
-
-
-def make_pick_place_dataloader(
-    dataset: Dataset,
-    batch_size: int = 32,
-    shuffle: bool = True,
-    num_workers: int = 0,
-) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, collate_fn=pick_place_collate)
 
 
 def lerobot_features(
@@ -330,10 +94,9 @@ def lerobot_features(
     state_dim: int,
     action_dim: int,
     image_key: str = _IMAGE_KEY,
-    image_dtype: str = "video",
 ) -> dict[str, dict[str, object]]:
     return {
-        image_key: {"dtype": image_dtype, "shape": (image_size, image_size, 3), "names": ["height", "width", "channels"]},
+        image_key: {"dtype": "video", "shape": (image_size, image_size, 3), "names": ["height", "width", "channels"]},
         _ROBOT_QPOS_KEY: {"dtype": "float32", "shape": (action_dim,), "names": [f"q_{i}" for i in range(action_dim)]},
         _STATE_KEY: {"dtype": "float32", "shape": (state_dim,), "names": [f"state_{i}" for i in range(state_dim)]},
         _ACTION_KEY: {"dtype": "float32", "shape": (action_dim,), "names": [f"target_q_{i}" for i in range(action_dim)]},
@@ -432,33 +195,20 @@ def frame_for_lerobot(obs: Mapping[str, torch.Tensor | str], action: torch.Tenso
     }
 
 
-def save_rollout_video(frames: Sequence[np.ndarray | torch.Tensor], path: str | Path, fps: int = 10) -> Path:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    images = []
-    for frame in frames:
-        tensor = _image_to_chw_float(frame)
-        images.append(_chw_float_to_hwc_uint8(tensor))
-    iio.imwrite(path, images, fps=fps)
-    return path
-
-
 def collect_expert_episode(
     env: _GenesisFrankaPickPlaceEnv,
     object_xy: torch.Tensor,
     target_xy: torch.Tensor,
     label: torch.Tensor | int,
     steps_per_segment: int = 12,
-) -> tuple[list[dict[str, object]], list[np.ndarray], torch.Tensor]:
+) -> tuple[list[dict[str, object]], torch.Tensor]:
     obs = env.reset(object_xy, target_xy, label)
     q_traj = env.expert_qpos_trajectory(steps_per_segment=steps_per_segment)
     rows: list[dict[str, object]] = []
-    frames: list[np.ndarray] = []
     for qpos in q_traj:
         rows.append(frame_for_lerobot(obs, qpos))
-        frames.append(_chw_float_to_hwc_uint8(torch.as_tensor(obs[_IMAGE_KEY])))
         obs = env.step_qpos(qpos)
-    return rows, frames, q_traj
+    return rows, q_traj
 
 
 def collect_genesis_franka_lerobot_dataset(
@@ -470,8 +220,6 @@ def collect_genesis_franka_lerobot_dataset(
     image_size: int | None = None,
     show_viewer: bool = False,
     backend: str = "gpu",
-    video_dir: str | Path | None = None,
-    use_videos: bool = True,
     vcodec: str = "h264",
 ):
     """Collect IK expert demonstrations and write a LeRobot dataset."""
@@ -493,18 +241,16 @@ def collect_genesis_franka_lerobot_dataset(
         fps=cfg.fps,
         root=root,
         robot_type="genesis_franka",
-        use_videos=use_videos,
-        features=lerobot_features(cfg.image_size, state_dim, action_dim, image_dtype="video" if use_videos else "image"),
+        use_videos=True,
+        features=lerobot_features(cfg.image_size, state_dim, action_dim),
         vcodec=vcodec,
     )
 
     for episode in range(n):
-        rows, frames, _ = collect_expert_episode(env, starts[episode], targets[episode], labels[episode], steps_per_segment)
+        rows, _ = collect_expert_episode(env, starts[episode], targets[episode], labels[episode], steps_per_segment)
         for row in rows:
             dataset.add_frame(row)
         dataset.save_episode()
-        if video_dir is not None:
-            save_rollout_video(frames, Path(video_dir) / f"episode_{episode:03d}.mp4", fps=cfg.fps)
 
     dataset.finalize()
     return dataset
@@ -513,8 +259,7 @@ def collect_genesis_franka_lerobot_dataset(
 def genesis_integration_notes() -> str:
     return (
         "Phase 1 path: env.GenesisFrankaPickPlaceEnv -> collect_expert_episode -> "
-        "collect_genesis_franka_lerobot_dataset. Load data with "
-        "LeRobotPickPlaceDataset and make_pick_place_dataloader."
+        "collect_genesis_franka_lerobot_dataset. Load data with LeRobotDataset."
     )
 
 
@@ -524,7 +269,6 @@ def main() -> None:
         n_episodes=2,
         steps_per_segment=8,
         image_size=96,
-        video_dir="rollouts/part1",
     )
 
 
