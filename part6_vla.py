@@ -9,7 +9,8 @@ import torch
 from PIL import Image
 from torch import nn
 
-from part1_simulator import FRANKA_QPOS_ACTION_DIM, TinyPickPlaceDataset, rollout_policy
+from env import FRANKA_QPOS_ACTION_DIM
+from part1_simulator import TinyPickPlaceDataset, rollout_policy
 from part4_transformer import TransformerBlock, make_block_attention_mask
 
 

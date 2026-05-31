@@ -5,8 +5,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from env import FRANKA_QPOS_ACTION_DIM, GENESIS_STATE_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import FRANKA_QPOS_ACTION_DIM, GENESIS_STATE_DIM, TinyPickPlaceDataset, rollout_policy
+from part1_simulator import TinyPickPlaceDataset, rollout_policy
 
 
 class StateMLPPolicy(nn.Module):

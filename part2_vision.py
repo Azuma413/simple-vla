@@ -105,7 +105,7 @@ class GenesisRenderDataset(Dataset):
             torch.save({"image": self.images, "label": self.labels, "xy": self.xy}, self.config.cache_path)
 
     def _render(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from part1_simulator import GenesisFrankaPickPlaceEnv, TinyPickPlaceConfig
+        from env import GenesisFrankaPickPlaceEnv, TinyPickPlaceConfig
 
         cfg = TinyPickPlaceConfig(n_episodes=self.config.n, image_size=self.config.image_size)
         env = GenesisFrankaPickPlaceEnv(cfg, image_size=self.config.image_size, backend=self.config.backend)
