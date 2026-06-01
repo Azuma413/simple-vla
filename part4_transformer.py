@@ -7,7 +7,7 @@ from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import rollout_policy
+from utils import rollout_policy
 
 
 def make_block_attention_mask(num_condition: int, chunk_size: int, device=None) -> torch.Tensor:

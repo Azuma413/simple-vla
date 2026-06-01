@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 import torch
 
 
-IMAGE_KEY = "observation.images.camera"
+FRONT_IMAGE_KEY = "observation.images.front"
+WRIST_IMAGE_KEY = "observation.images.wrist"
+IMAGE_KEYS = (FRONT_IMAGE_KEY, WRIST_IMAGE_KEY)
 STATE_KEY = "observation.state"
 ROBOT_QPOS_KEY = "observation.robot_qpos"
 ACTION_KEY = "action"
@@ -42,7 +45,7 @@ class TinyPickPlaceConfig:
 
     n_episodes: int = 8
     horizon: int = 72
-    image_size: int = 96
+    image_size: int = 225
     fps: int = 10
     dt: float = 0.1
     seed: int = 0
@@ -56,6 +59,12 @@ class TinyPickPlaceConfig:
     gripper_open: float = 0.04
     gripper_closed: float = 0.0
     home_qpos: tuple[float, ...] = (0.0, -0.4, 0.0, -2.2, 0.0, 2.0, 0.8, 0.04, 0.04)
+    table_texture_path: str | None = None
+    ambient_light: tuple[float, float, float] = (0.10, 0.10, 0.10)
+    directional_light_dir: tuple[float, float, float] = (-1.0, -1.0, -1.0)
+    directional_light_color: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    directional_light_intensity: float = 5.0
+    background_color: tuple[float, float, float] = (0.04, 0.08, 0.12)
 
 
 @dataclass
@@ -86,7 +95,8 @@ class GenesisFrankaPickPlaceEnv:
         self.cubes = []
         self.cube = None
         self.goal_marker = None
-        self.camera = None
+        self.front_camera = None
+        self.wrist_camera = None
         self.ee_link = None
         self.motors_dof = np.arange(7)
         self.fingers_dof = np.arange(7, 9)
@@ -104,13 +114,26 @@ class GenesisFrankaPickPlaceEnv:
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=0.01),
             rigid_options=gs.options.RigidOptions(box_box_detection=True),
+            vis_options=gs.options.VisOptions(
+                ambient_light=self.config.ambient_light,
+                background_color=self.config.background_color,
+                lights=[
+                    {
+                        "type": "directional",
+                        "dir": self.config.directional_light_dir,
+                        "color": self.config.directional_light_color,
+                        "intensity": self.config.directional_light_intensity,
+                    }
+                ],
+            ),
             show_viewer=self.show_viewer,
             renderer=gs.renderers.Rasterizer(),
         )
         self.scene.add_entity(gs.morphs.Plane())
+        table_surface = self._table_surface()
         self.table = self.scene.add_entity(
             gs.morphs.Box(pos=(0.50, 0.0, -self.config.table_size[2] / 2), size=self.config.table_size, fixed=True),
-            surface=gs.surfaces.Default(color=(0.72, 0.72, 0.68, 1.0)),
+            surface=table_surface,
         )
         self.franka = self.scene.add_entity(gs.morphs.MJCF(file="xml/franka_emika_panda/panda.xml"))
         self.cubes = [
@@ -130,11 +153,17 @@ class GenesisFrankaPickPlaceEnv:
             surface=gs.surfaces.Default(color=(1.0, 0.90, 0.10, 0.55)),
             name="target_marker",
         )
-        self.camera = self.scene.add_camera(
+        self.front_camera = self.scene.add_camera(
             res=(self.image_size, self.image_size),
-            pos=(0.62, -0.82, 0.64),
-            lookat=(0.50, 0.00, 0.04),
+            pos=(0.62, -0.88, 0.56),
+            lookat=(0.50, 0.00, 0.05),
             fov=48,
+        )
+        self.wrist_camera = self.scene.add_camera(
+            res=(self.image_size, self.image_size),
+            pos=(0.50, -0.18, 0.38),
+            lookat=(0.50, 0.00, 0.06),
+            fov=62,
         )
         self.scene.build()
         self.ee_link = self.franka.get_link("hand")
@@ -205,9 +234,10 @@ class GenesisFrankaPickPlaceEnv:
         gripper_width = qpos[-2:].sum()[None]
         state = torch.cat([qpos, self.object_xyz, self.target_xyz, gripper_width])
         task = f"pick the {COLOR_NAMES[int(self.label)]} cube and place it on the target"
-        image = self.render()
+        images = self.render_images()
         return {
-            IMAGE_KEY: image,
+            FRONT_IMAGE_KEY: images[FRONT_IMAGE_KEY],
+            WRIST_IMAGE_KEY: images[WRIST_IMAGE_KEY],
             STATE_KEY: state,
             ROBOT_QPOS_KEY: qpos,
             OBJECT_POSE_KEY: object_pose,
@@ -216,7 +246,9 @@ class GenesisFrankaPickPlaceEnv:
             TARGET_XYZ_KEY: self.target_xyz.clone(),
             GRIPPER_WIDTH_KEY: gripper_width,
             "label": self.label.clone()[None],
-            "image": image,
+            "image": images[FRONT_IMAGE_KEY],
+            "front_image": images[FRONT_IMAGE_KEY],
+            "wrist_image": images[WRIST_IMAGE_KEY],
             "state": state,
             "frame_index": torch.tensor(self.t, dtype=torch.long),
             TASK_KEY: task,
@@ -229,10 +261,50 @@ class GenesisFrankaPickPlaceEnv:
         quat = torch.as_tensor(self.cube.get_quat(), dtype=torch.float32).flatten()
         return torch.cat([self.object_xyz, quat])
 
-    def render(self) -> torch.Tensor:
-        assert self.camera is not None
-        rgb = self.camera.render(rgb=True, depth=False, segmentation=False)[0]
+    def _render_camera(self, camera) -> torch.Tensor:
+        rgb = camera.render(rgb=True, depth=False, segmentation=False)[0]
         return torch.as_tensor(rgb.copy(), dtype=torch.float32).permute(2, 0, 1) / 255.0
+
+    def render_images(self) -> dict[str, torch.Tensor]:
+        assert self.front_camera is not None and self.wrist_camera is not None
+        self._update_wrist_camera_pose()
+        return {
+            FRONT_IMAGE_KEY: self._render_camera(self.front_camera),
+            WRIST_IMAGE_KEY: self._render_camera(self.wrist_camera),
+        }
+
+    def _table_surface(self):
+        import genesis as gs
+
+        if self.config.table_texture_path is None:
+            return gs.surfaces.Default(color=(0.72, 0.72, 0.68, 1.0))
+        texture = self._load_or_make_texture(self.config.table_texture_path)
+        return gs.surfaces.Default(diffuse_texture=gs.textures.ImageTexture(image_array=texture))
+
+    def _load_or_make_texture(self, texture_path: str) -> np.ndarray:
+        if texture_path == "checker":
+            size = 256
+            yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+            checker = ((xx // 32 + yy // 32) % 2).astype(np.uint8)
+            dark = np.array([60, 66, 58], dtype=np.uint8)
+            light = np.array([172, 168, 148], dtype=np.uint8)
+            return np.where(checker[..., None] == 1, light, dark)
+
+        from PIL import Image
+
+        path = Path(texture_path)
+        return np.array(Image.open(path).convert("RGB"))
+
+    def _update_wrist_camera_pose(self) -> None:
+        assert self.ee_link is not None and self.wrist_camera is not None
+        ee_pos = torch.as_tensor(self.ee_link.get_pos(), dtype=torch.float32).flatten()
+        camera_pos = ee_pos + torch.tensor([0.0, -0.10, 0.06])
+        lookat = ee_pos + torch.tensor([0.0, 0.0, -0.08])
+        self.wrist_camera.set_pose(
+            pos=camera_pos.detach().cpu().numpy(),
+            lookat=lookat.detach().cpu().numpy(),
+            up=(0.0, 0.0, 1.0),
+        )
 
     def ik_qpos_for(self, xyz: torch.Tensor, finger_qpos: float, init_qpos: torch.Tensor | None = None) -> torch.Tensor:
         assert self.franka is not None and self.ee_link is not None
@@ -260,23 +332,11 @@ class GenesisFrankaPickPlaceEnv:
             ExpertWaypoint("retreat", self.target_xyz + torch.tensor([0.0, 0.0, 0.22]), open_q),
         ]
 
-    def expert_qpos_trajectory(self, steps_per_segment: int = 12) -> torch.Tensor:
-        assert self.franka is not None
+    def expert_stage_action(self, stage: str) -> torch.Tensor:
+        stage = stage.replace("_", "-")
+        waypoint = {waypoint.stage: waypoint for waypoint in self.expert_waypoints()}[stage]
         current = torch.as_tensor(self.franka.get_dofs_position(), dtype=torch.float32).flatten()
-        q_waypoints = []
-        init = current
-        for waypoint in self.expert_waypoints():
-            q = self.ik_qpos_for(waypoint.xyz, waypoint.finger_qpos, init_qpos=init)
-            q_waypoints.append(q)
-            init = q
-
-        trajectory = []
-        prev = current
-        for target in q_waypoints:
-            alpha = torch.linspace(0.0, 1.0, steps_per_segment + 1)[1:, None]
-            trajectory.append(prev[None] * (1.0 - alpha) + target[None] * alpha)
-            prev = target
-        return torch.cat(trajectory, dim=0)
+        return self.ik_qpos_for(waypoint.xyz, waypoint.finger_qpos, init_qpos=current)
 
     def step(self, action: torch.Tensor) -> tuple[dict[str, torch.Tensor | str], float, bool, dict[str, float]]:
         obs = self.step_qpos(action)

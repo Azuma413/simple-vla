@@ -7,7 +7,7 @@ from torch import nn
 
 from env import FRANKA_QPOS_ACTION_DIM, GENESIS_STATE_DIM
 from part2_vision import SmallVisionEncoder
-from part1_simulator import rollout_policy
+from utils import rollout_policy
 
 
 class StateMLPPolicy(nn.Module):
